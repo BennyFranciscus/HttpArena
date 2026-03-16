@@ -11,6 +11,7 @@ const pool_mod = @import("pool.zig");
 const ConnPool = pool_mod.ConnPool;
 const ConnState = pool_mod.ConnState;
 const compress_mod = @import("compress.zig");
+const log_mod = @import("log.zig");
 const Request = types.Request;
 const Response = types.Response;
 
@@ -34,6 +35,7 @@ pub const Config = struct {
     keep_alive_timeout: u32 = 60, // seconds (0 = disable)
     shutdown_timeout: u32 = 30, // seconds to drain connections before force-close (0 = immediate)
     compression: bool = true, // enable gzip/deflate response compression
+    logging: log_mod.LogConfig = .{}, // request logging (disabled by default)
 };
 
 // ── Shared shutdown state (atomic, shared across worker threads) ─────
@@ -136,6 +138,7 @@ fn workerThread(router: *Router, config: Config, is_primary: bool) void {
     const ka_timeout: i64 = @intCast(config.keep_alive_timeout);
     const drain_timeout: i64 = @intCast(config.shutdown_timeout);
     const compression_enabled = config.compression;
+    const log_config = config.logging;
 
     // Initialize connection pool for this worker
     var pool = ConnPool.init(alloc, POOL_SIZE) catch return;
@@ -284,55 +287,156 @@ fn workerThread(router: *Router, config: Config, is_primary: bool) void {
             if (ev.events & linux.EPOLL.IN != 0) {
                 var should_close = false;
 
-                while (st.read_len < BUF_SIZE) {
-                    const n_read = posix.read(fd, st.read_buf[st.read_len..]) catch {
-                        should_close = true;
+                // Labeled drain loop: after dynamic buffer promotion,
+                // we must re-read immediately (edge-triggered epoll won't fire again).
+                drain: while (true) {
+                    // Body discard mode — drain socket without buffering
+                    if (st.isDiscarding()) {
+                        var discard_buf: [65536]u8 = undefined;
+                        while (st.discard_remaining > 0) {
+                            const to_read = @min(discard_buf.len, st.discard_remaining);
+                            const n_read = posix.read(fd, discard_buf[0..to_read]) catch |err| {
+                                if (err == error.WouldBlock) break;
+                                should_close = true;
+                                break;
+                            };
+                            if (n_read == 0) {
+                                should_close = true;
+                                break;
+                            }
+                            st.discardBytes(n_read);
+                        }
+
+                        if (st.discardComplete()) {
+                            if (st.finishDiscard()) |hdr_result| {
+                                var req = hdr_result.request;
+                                var res = Response{};
+                                if (shutdown_flag.load(.acquire)) {
+                                    res.headers.set("Connection", "close");
+                                }
+                                const logging = log_config.enabled;
+                                const req_start = if (logging) log_mod.now() else 0;
+                                router.handle(&req, &res);
+                                if (compression_enabled) {
+                                    var compress_buf2: [COMPRESS_BUF_SIZE]u8 = undefined;
+                                    _ = compress_mod.compressResponse(&compress_buf2, &req, &res);
+                                }
+                                if (logging) {
+                                    log_mod.logRequest(log_config, &req, &res, req_start);
+                                }
+                                res.writeTo(&st.write_list);
+                                st.touch();
+                            }
+                        }
                         break;
-                    };
-                    if (n_read == 0) {
-                        should_close = true;
-                        break;
-                    }
-                    st.read_len += n_read;
-                }
-
-                // Parse and handle pipelined requests
-                var compress_buf: [COMPRESS_BUF_SIZE]u8 = undefined;
-                var off: usize = 0;
-                while (off < st.read_len) {
-                    const result = parser.parse(st.read_buf[off..st.read_len]) orelse break;
-                    var req = result.request;
-                    var res = Response{};
-
-                    // During shutdown, signal clients to close
-                    if (shutdown_flag.load(.acquire)) {
-                        res.headers.set("Connection", "close");
                     }
 
-                    router.handle(&req, &res);
-
-                    // Apply response compression if enabled
-                    if (compression_enabled) {
-                        _ = compress_mod.compressResponse(&compress_buf, &req, &res);
+                    // Read into active buffer (static or dynamic)
+                    while (true) {
+                        const rem_buf = st.readBufRemaining() orelse break;
+                        if (rem_buf.len == 0) break;
+                        const n_read = posix.read(fd, rem_buf) catch |err| {
+                            if (err == error.WouldBlock) break; // No more data right now — wait for next epoll event
+                            should_close = true;
+                            break;
+                        };
+                        if (n_read == 0) {
+                            should_close = true;
+                            break;
+                        }
+                        st.advanceRead(n_read);
+                        // If still in static buffer and full, stop — check promotion below
+                        if (st.dyn_buf == null and st.read_len >= BUF_SIZE) break;
                     }
 
-                    res.writeTo(&st.write_list);
+                    // Parse and handle pipelined requests
+                    var compress_buf: [COMPRESS_BUF_SIZE]u8 = undefined;
+                    const logging = log_config.enabled;
+                    var off: usize = 0;
+                    const cur_len = st.activeReadLen();
+                    const cur_data = st.readSlice();
+                    while (off < cur_len) {
+                        const result = parser.parse(cur_data[off..cur_len]) orelse {
+                            const remaining = cur_data[off..cur_len];
+                            if (mem.indexOf(u8, remaining, "\r\n\r\n")) |hdr_end| {
+                                // Try body discard for large bodies
+                                const hdr_data = remaining[0 .. hdr_end + 4];
+                                if (parser.parseHeaders(hdr_data)) |hdr_result| {
+                                    if (hdr_result.content_length != null and hdr_result.content_length.? > BUF_SIZE) {
+                                        const body_bytes_in_buf = cur_len - off - (hdr_end + 4);
+                                        st.enterDiscardMode(hdr_result, body_bytes_in_buf);
+                                        off = cur_len;
+                                        continue :drain; // Re-enter drain to discard remaining body bytes
+                                    }
+                                }
+                                // Genuinely bad request — send 400
+                                const bad_resp = "HTTP/1.1 400 Bad Request\r\nServer: blitz\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+                                st.write_list.appendSlice(bad_resp) catch {};
+                                off += hdr_end + 4;
+                                should_close = true;
+                                break;
+                            }
+                            break; // Incomplete data — wait for more
+                        };
+                        var req = result.request;
+                        var res = Response{};
 
-                    off += result.total_len;
-                }
+                        // During shutdown, signal clients to close
+                        if (shutdown_flag.load(.acquire)) {
+                            res.headers.set("Connection", "close");
+                        }
 
-                if (off > 0) {
-                    const rem = st.read_len - off;
-                    if (rem > 0) std.mem.copyForwards(u8, st.read_buf[0..rem], st.read_buf[off..st.read_len]);
-                    st.read_len = rem;
-                    st.touch();
+                        // Capture start time for request logging
+                        const req_start = if (logging) log_mod.now() else 0;
+
+                        router.handle(&req, &res);
+
+                        // Apply response compression if enabled
+                        if (compression_enabled) {
+                            _ = compress_mod.compressResponse(&compress_buf, &req, &res);
+                        }
+
+                        // Log completed request
+                        if (logging) {
+                            log_mod.logRequest(log_config, &req, &res, req_start);
+                        }
+
+                        res.writeTo(&st.write_list);
+
+                        off += result.total_len;
+                    }
+
+                    if (off > 0 and !st.isDiscarding()) {
+                        if (st.dyn_buf != null) {
+                            // Done with large body — revert to static buffer
+                            const rem = st.dyn_len - off;
+                            if (rem > 0 and rem <= BUF_SIZE) {
+                                @memcpy(st.read_buf[0..rem], st.dyn_buf.?[off..st.dyn_len]);
+                            }
+                            st.revertToStatic();
+                            st.read_len = if (rem <= BUF_SIZE) rem else 0;
+                        } else {
+                            const rem = st.read_len - off;
+                            if (rem > 0) std.mem.copyForwards(u8, st.read_buf[0..rem], st.read_buf[off..st.read_len]);
+                            st.read_len = rem;
+                        }
+                        st.touch();
+                    }
+
+                    break; // Normal exit from drain loop
                 }
 
                 // Flush writes
                 if (st.write_list.items.len > st.write_off) {
-                    const written = posix.write(fd, st.write_list.items[st.write_off..]) catch blk: {
+                    const written = posix.write(fd, st.write_list.items[st.write_off..]) catch |err| blk: {
+                        if (err == error.WouldBlock) {
+                            // Send buffer full — register for EPOLLOUT and retry later
+                            var mev = linux.epoll_event{ .events = linux.EPOLL.IN | linux.EPOLL.OUT | linux.EPOLL.ET, .data = .{ .fd = fd } };
+                            posix.epoll_ctl(epfd, linux.EPOLL.CTL_MOD, fd, &mev) catch {};
+                            break :blk @as(usize, 0);
+                        }
                         should_close = true;
-                        break :blk 0;
+                        break :blk @as(usize, 0);
                     };
                     st.write_off += written;
                     if (st.write_off >= st.write_list.items.len) {
@@ -491,4 +595,27 @@ fn timerfdSetInterval(fd: i32, seconds: i64) void {
 fn setSockOptInt(fd: i32, level: i32, optname: u32, val: c_int) void {
     const v = mem.toBytes(val);
     posix.setsockopt(fd, level, optname, &v) catch {};
+}
+
+/// Scan raw header bytes for a Content-Length value.
+/// Returns the parsed value or null if not found.
+pub fn detectContentLength(headers: []const u8) ?usize {
+    var pos: usize = 0;
+    while (pos < headers.len) {
+        const line_end = mem.indexOf(u8, headers[pos..], "\r\n") orelse headers.len - pos;
+        const line = headers[pos .. pos + line_end];
+        if (line.len > 16) { // "Content-Length: " = 16 chars
+            const colon = mem.indexOfScalar(u8, line, ':') orelse {
+                pos += line_end + 2;
+                continue;
+            };
+            const name = line[0..colon];
+            if (name.len == 14 and types.asciiEqlIgnoreCase(name, "Content-Length")) {
+                const value = mem.trimLeft(u8, line[colon + 1 ..], " ");
+                return std.fmt.parseInt(usize, value, 10) catch null;
+            }
+        }
+        pos += line_end + 2;
+    }
+    return null;
 }
