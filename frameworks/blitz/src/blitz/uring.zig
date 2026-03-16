@@ -11,6 +11,7 @@ const parser = @import("parser.zig");
 const Router = @import("router.zig").Router;
 const compress_mod = @import("compress.zig");
 const log_mod = @import("log.zig");
+const websocket = @import("websocket.zig");
 const SpscQueue = @import("spsc.zig").SpscQueue;
 const Request = types.Request;
 const Response = types.Response;
@@ -21,7 +22,7 @@ const ACCEPTOR_RING_ENTRIES: u16 = 4096;
 const REACTOR_RING_ENTRIES: u16 = 8192;
 const CQE_BATCH: usize = 256;
 const RECV_BUF_SIZE: u32 = 4096;
-const RECV_BUF_COUNT: u16 = 4096; // must be power of 2
+const RECV_BUF_COUNT: u16 = 2048; // must be power of 2 (2048 × 4KB = 8MB per reactor)
 const COMPRESS_BUF_SIZE: usize = 131072; // 128KB
 const BUFFER_GROUP_ID: u16 = 0;
 const SPSC_CAPACITY: usize = 8192; // power of 2
@@ -49,6 +50,8 @@ const IORING_CQE_F_NOTIF: u32 = linux.IORING_CQE_F_NOTIF;
 const IOSQE_FIXED_FILE: u8 = linux.IOSQE_FIXED_FILE;
 
 // ── User data encoding ─────────────────────────────────────────────
+// Layout: [op:8][gen:24][fd:32]
+// Generation counters prevent stale CQEs from corrupting reused fd slots
 const Op = enum(u8) {
     accept = 1,
     recv = 2,
@@ -57,17 +60,26 @@ const Op = enum(u8) {
     close = 5,
 };
 
-fn packUserData(op: Op, fd: i32) u64 {
-    return (@as(u64, @intFromEnum(op)) << 56) | @as(u64, @intCast(@as(u32, @bitCast(fd))));
+fn packUserData(op: Op, gen: u24, fd: i32) u64 {
+    return (@as(u64, @intFromEnum(op)) << 56) |
+        (@as(u64, gen) << 32) |
+        @as(u64, @intCast(@as(u32, @bitCast(fd))));
 }
 
 fn unpackOp(ud: u64) Op {
     return @enumFromInt(@as(u8, @truncate(ud >> 56)));
 }
 
+fn unpackGen(ud: u64) u24 {
+    return @truncate(ud >> 32);
+}
+
 fn unpackFd(ud: u64) i32 {
     return @bitCast(@as(u32, @truncate(ud)));
 }
+
+// Linux error codes for io_uring
+const ENOBUFS: i32 = -105;
 
 // Body discard threshold — bodies larger than this are counted, not buffered
 const BODY_DISCARD_THRESHOLD: usize = 65536;
@@ -80,6 +92,7 @@ const ConnState = struct {
     write_off: usize = 0,
     send_inflight: bool = false,
     zc_notif_pending: bool = false,
+    gen: u24 = 0, // generation counter — incremented on reuse, detects stale CQEs
     dyn_buf: ?[]u8 = null,
 
     // Body discard mode — count body bytes without buffering
@@ -88,6 +101,8 @@ const ConnState = struct {
     discard_req: ?parser.HeaderResult = null, // parsed request headers
     dyn_len: usize = 0,
     dyn_alloc: ?std.mem.Allocator = null,
+    // WebSocket mode — after upgrade, bypass HTTP parsing
+    ws_mode: bool = false,
 
     fn init(alloc: std.mem.Allocator) ConnState {
         return .{ .write_buf = std.ArrayList(u8).init(alloc) };
@@ -150,6 +165,7 @@ const ConnState = struct {
         self.discard_remaining = 0;
         self.discard_header_len = 0;
         self.discard_req = null;
+        self.ws_mode = false;
     }
 
     fn isDiscarding(self: *const ConnState) bool {
@@ -305,6 +321,12 @@ pub const UringServer = struct {
         const alloc = std.heap.c_allocator;
         const n_reactors = self.config.threads orelse @max(Thread.getCpuCount() catch 1, 1);
 
+        // Probe io_uring availability before committing to this backend
+        {
+            var probe_ring = IoUring.init(32, 0) catch return error.UringNotAvailable;
+            probe_ring.deinit();
+        }
+
         // Create a single listen socket
         const listen_fd: i32 = @intCast(posix.socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0) catch return error.SocketError);
         setSockOptInt(listen_fd, SOL_SOCKET, SO_REUSEPORT, 1);
@@ -353,29 +375,42 @@ pub const UringServer = struct {
 // ACCEPTOR THREAD — dedicated accept loop, distributes fds round-robin
 // ═══════════════════════════════════════════════════════════════════
 
+fn logErr(comptime msg: []const u8) void {
+    _ = posix.write(2, msg ++ "\n") catch {};
+}
+
 fn acceptorThread(
     listen_fd: i32,
     queues: []SpscQueue(i32),
     n_reactors: usize,
 ) void {
     // Acceptor uses a simple io_uring ring — just multishot accept + signal pipe
-    var ring = IoUring.init(ACCEPTOR_RING_ENTRIES, 0) catch return;
+    var ring = IoUring.init(ACCEPTOR_RING_ENTRIES, 0) catch {
+        logErr("uring: acceptor ring init failed");
+        return;
+    };
     defer ring.deinit();
 
     // Arm multishot accept
     _ = ring.accept_multishot(
-        packUserData(.accept, listen_fd),
+        packUserData(.accept, 0, listen_fd),
         listen_fd,
         null,
         null,
         SOCK_NONBLOCK,
-    ) catch return;
-    _ = ring.submit() catch return;
+    ) catch {
+        logErr("uring: multishot accept failed");
+        return;
+    };
+    _ = ring.submit() catch {
+        logErr("uring: submit failed");
+        return;
+    };
 
     // Monitor signal pipe for shutdown
     if (signal_pipe[0] >= 0) {
         _ = ring.poll_add(
-            packUserData(.cancel, signal_pipe[0]),
+            packUserData(.cancel, 0, signal_pipe[0]),
             signal_pipe[0],
             linux.POLL.IN,
         ) catch {};
@@ -424,7 +459,7 @@ fn acceptorThread(
                     // Re-arm if kernel dropped multishot
                     if (cqe.flags & IORING_CQE_F_MORE == 0) {
                         _ = ring.accept_multishot(
-                            packUserData(.accept, listen_fd),
+                            packUserData(.accept, 0, listen_fd),
                             listen_fd,
                             null,
                             null,
@@ -479,7 +514,10 @@ fn reactorThread(
             .sq_thread_idle = 1000,
         });
         break :blk IoUring.init_params(REACTOR_RING_ENTRIES, &params2) catch blk2: {
-            break :blk2 IoUring.init(REACTOR_RING_ENTRIES, 0) catch return;
+            break :blk2 IoUring.init(REACTOR_RING_ENTRIES, 0) catch {
+                logErr("uring: reactor ring init failed");
+                return;
+            };
         };
     };
     defer ring.deinit();
@@ -489,15 +527,25 @@ fn reactorThread(
 
     // Buffer ring for recv
     const slab_size: usize = @as(usize, RECV_BUF_COUNT) * @as(usize, RECV_BUF_SIZE);
-    const slab = alloc.alloc(u8, slab_size) catch return;
+    const slab = alloc.alloc(u8, slab_size) catch {
+        logErr("uring: slab alloc failed");
+        return;
+    };
     defer alloc.free(slab);
 
-    var buf_group = BufferGroup.init(&ring, BUFFER_GROUP_ID, slab, RECV_BUF_SIZE, RECV_BUF_COUNT) catch return;
+    var buf_group = BufferGroup.init(&ring, BUFFER_GROUP_ID, slab, RECV_BUF_SIZE, RECV_BUF_COUNT) catch {
+        logErr("uring: buffer group init failed");
+        return;
+    };
     defer buf_group.deinit();
 
     // Connection state (sparse, indexed by fd)
     var conns: [MAX_CONNS]?*ConnState = undefined;
     @memset(&conns, null);
+
+    // Generation counters per fd slot — incremented on each close, used to detect stale CQEs
+    var conn_gens: [MAX_CONNS]u24 = undefined;
+    @memset(&conn_gens, 0);
 
     // Connection pool
     var pool_opt = UringConnPool.init(alloc);
@@ -507,6 +555,7 @@ fn reactorThread(
 
     // Main reactor event loop
     var cqes: [CQE_BATCH]linux.io_uring_cqe = undefined;
+    var active_conns: usize = 0;
 
     while (!shutdown_flag.load(.acquire)) {
         // 1. Drain new connections from SPSC queue
@@ -527,11 +576,13 @@ fn reactorThread(
             if (from_pool == null) {
                 st.* = ConnState.init(alloc);
             }
+            const gen = conn_gens[fd_idx];
+            st.gen = gen;
             conns[fd_idx] = st;
 
             // Arm multishot recv
             _ = buf_group.recv_multishot(
-                packUserData(.recv, new_fd),
+                packUserData(.recv, gen, new_fd),
                 new_fd,
                 0,
             ) catch {
@@ -541,17 +592,25 @@ fn reactorThread(
                 continue;
             };
             drained += 1;
+            active_conns += 1;
         }
         if (drained > 0) {
             _ = ring.submit() catch {};
         }
 
-        // 2. Process CQEs
-        const count = ring.copy_cqes(&cqes, 1) catch |err| {
+        // 2. Process CQEs — use wait_nr=1 only when connections are active
+        //    (armed SQEs exist), otherwise poll non-blocking + sleep to
+        //    avoid blocking forever when no SQEs are armed
+        const wait_nr: u32 = if (active_conns > 0) 1 else 0;
+        const count = ring.copy_cqes(&cqes, wait_nr) catch |err| {
             if (err == error.SignalInterrupt) continue;
             break;
         };
-        if (count == 0) continue;
+        if (count == 0) {
+            // No CQEs and no active connections — brief yield before checking SPSC again
+            std.time.sleep(100_000); // 100µs
+            continue;
+        }
 
         var compress_buf: [COMPRESS_BUF_SIZE]u8 = undefined;
         var needs_submit = false;
@@ -566,192 +625,276 @@ fn reactorThread(
             switch (op) {
                 .recv => {
                     const has_more = (cqe.flags & IORING_CQE_F_MORE) != 0;
+                    const cqe_gen = unpackGen(ud);
+                    const uidx: usize = @intCast(@as(u32, @bitCast(fd)));
+
+                    // Stale CQE check — fd was closed+reused since this recv was armed
+                    if (uidx >= MAX_CONNS or conns[uidx] == null or conn_gens[uidx] != cqe_gen) {
+                        if (cqe.buffer_id()) |_| {
+                            buf_group.put_cqe(cqe) catch {};
+                        } else |_| {}
+                        continue; // discard stale CQE, don't close (fd belongs to new connection)
+                    }
 
                     if (res <= 0) {
                         if (cqe.buffer_id()) |_| {
                             buf_group.put_cqe(cqe) catch {};
                         } else |_| {}
-                        closeConn(&conns, &pool_opt, &ring, fd, alloc, false);
+                        // -ENOBUFS = buffer ring temporarily exhausted — re-arm recv instead of closing
+                        if (res == ENOBUFS) {
+                            if (!has_more) {
+                                _ = buf_group.recv_multishot(
+                                    packUserData(.recv, cqe_gen, fd),
+                                    fd,
+                                    0,
+                                ) catch {};
+                                needs_submit = true;
+                            }
+                            continue;
+                        }
+                        closeConn(&conns, &conn_gens, &pool_opt, &ring, fd, alloc, false); active_conns -|= 1;
                         continue;
                     }
 
-                    const recv_data = buf_group.get_cqe(cqe) catch continue;
+                    const recv_data = buf_group.get_cqe(cqe) catch {
+                        // Failed to extract data — return buffer to avoid leak
+                        buf_group.put_cqe(cqe) catch {};
+                        continue;
+                    };
 
-                    const uidx: usize = @intCast(@as(u32, @bitCast(fd)));
-                    if (uidx < MAX_CONNS) {
-                        if (conns[uidx]) |st| {
-                            // Body discard mode — just count bytes, don't buffer
-                            if (st.isDiscarding()) {
-                                buf_group.put_cqe(cqe) catch {};
-                                st.discardBytes(recv_data.len);
+                    const st = conns[uidx].?; // guaranteed non-null by stale check above
 
-                                if (st.discardComplete()) {
-                                    // All body bytes received — invoke handler
-                                    if (st.finishDiscard()) |hdr_result| {
-                                        var req = hdr_result.request;
-                                        var resp = Response{};
+                    // Body discard mode — just count bytes, don't buffer
+                    if (st.isDiscarding()) {
+                        buf_group.put_cqe(cqe) catch {};
+                        st.discardBytes(recv_data.len);
 
-                                        if (shutdown_flag.load(.acquire)) {
-                                            resp.headers.set("Connection", "close");
-                                        }
-
-                                        const req_start = if (logging) log_mod.now() else 0;
-                                        router.handle(&req, &resp);
-
-                                        if (compression_enabled) {
-                                            _ = compress_mod.compressResponse(&compress_buf, &req, &resp);
-                                        }
-                                        if (logging) {
-                                            log_mod.logRequest(log_config, &req, &resp, req_start);
-                                        }
-
-                                        resp.writeTo(&st.write_buf);
-                                    }
-                                }
-
-                                // Submit send if data ready (after discard complete)
-                                if (st.write_buf.items.len > st.write_off and !st.send_inflight) {
-                                    const send_data = st.write_buf.items[st.write_off..];
-                                    if (send_zc_state != 2) {
-                                        armSendZc(&ring, fd, send_data) catch {
-                                            armSend(&ring, fd, send_data) catch {};
-                                        };
-                                    } else {
-                                        armSend(&ring, fd, send_data) catch {};
-                                    }
-                                    st.send_inflight = true;
-                                    needs_submit = true;
-                                }
-
-                                if (!has_more) {
-                                    if (conns[uidx] != null) {
-                                        _ = buf_group.recv_multishot(
-                                            packUserData(.recv, fd),
-                                            fd,
-                                            0,
-                                        ) catch continue;
-                                        needs_submit = true;
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Normal mode — copy recv data into connection buffer
-                            if (st.dyn_buf) |dbuf| {
-                                const space = dbuf.len - st.dyn_len;
-                                const copy_len = @min(recv_data.len, space);
-                                @memcpy(dbuf[st.dyn_len..][0..copy_len], recv_data[0..copy_len]);
-                                st.dyn_len += copy_len;
-                            } else {
-                                const space = st.read_buf.len - st.read_len;
-                                const copy_len = @min(recv_data.len, space);
-                                @memcpy(st.read_buf[st.read_len..][0..copy_len], recv_data[0..copy_len]);
-                                st.read_len += copy_len;
-                            }
-
-                            // Return buffer to kernel (zero-SQE)
-                            buf_group.put_cqe(cqe) catch {};
-
-                            // Parse and handle pipelined requests
-                            var off: usize = 0;
-                            const cur_len = st.activeReadLen();
-                            const cur_data = st.readSlice();
-                            while (off < cur_len) {
-                                const result = parser.parse(cur_data[off..cur_len]) orelse {
-                                    const remaining = cur_data[off..cur_len];
-                                    if (mem.indexOf(u8, remaining, "\r\n\r\n")) |hdr_end| {
-                                        // Try header-only parse for body discard
-                                        const hdr_data = remaining[0 .. hdr_end + 4];
-                                        if (parser.parseHeaders(hdr_data)) |hdr_result| {
-                                            if (hdr_result.content_length != null and hdr_result.content_length.? > BODY_DISCARD_THRESHOLD) {
-                                                // Enter body discard mode
-                                                const body_bytes_in_buf = cur_len - off - (hdr_end + 4);
-                                                st.enterDiscardMode(hdr_result, body_bytes_in_buf);
-                                                // Adjust off to skip headers + body bytes in buffer
-                                                off = cur_len;
-                                                break;
-                                            }
-                                        }
-                                        const bad_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
-                                        st.write_buf.appendSlice(bad_resp) catch {};
-                                        off += hdr_end + 4;
-                                        break;
-                                    }
-                                    break;
-                                };
-                                var req = result.request;
+                        if (st.discardComplete()) {
+                            if (st.finishDiscard()) |hdr_result| {
+                                var req = hdr_result.request;
                                 var resp = Response{};
-
-                                if (shutdown_flag.load(.acquire)) {
-                                    resp.headers.set("Connection", "close");
-                                }
-
+                                if (shutdown_flag.load(.acquire)) resp.headers.set("Connection", "close");
                                 const req_start = if (logging) log_mod.now() else 0;
                                 router.handle(&req, &resp);
-
-                                if (compression_enabled) {
-                                    _ = compress_mod.compressResponse(&compress_buf, &req, &resp);
-                                }
-                                if (logging) {
-                                    log_mod.logRequest(log_config, &req, &resp, req_start);
-                                }
-
+                                if (compression_enabled) _ = compress_mod.compressResponse(&compress_buf, &req, &resp);
+                                if (logging) log_mod.logRequest(log_config, &req, &resp, req_start);
                                 resp.writeTo(&st.write_buf);
-                                off += result.total_len;
                             }
+                        }
 
-                            // Compact read buffer
-                            if (off > 0 and !st.isDiscarding()) {
-                                if (st.dyn_buf != null) {
-                                    const rem = st.dyn_len - off;
-                                    if (rem > 0 and rem <= 65536) {
-                                        @memcpy(st.read_buf[0..rem], st.dyn_buf.?[off..st.dyn_len]);
+                        // Submit send if data ready
+                        if (st.write_buf.items.len > st.write_off and !st.send_inflight) {
+                            const send_data = st.write_buf.items[st.write_off..];
+                            if (send_zc_state != 2) {
+                                armSendZc(&ring, cqe_gen, fd, send_data) catch {
+                                    armSend(&ring, cqe_gen, fd, send_data) catch {};
+                                };
+                            } else {
+                                armSend(&ring, cqe_gen, fd, send_data) catch {};
+                            }
+                            st.send_inflight = true;
+                            needs_submit = true;
+                        }
+
+                        if (!has_more) {
+                            _ = buf_group.recv_multishot(packUserData(.recv, cqe_gen, fd), fd, 0) catch {};
+                            needs_submit = true;
+                        }
+                        continue;
+                    }
+
+                    // WebSocket mode — echo frames instead of HTTP parsing
+                    if (st.ws_mode) {
+                        // Copy recv data into connection buffer
+                        const ws_space = st.read_buf.len - st.read_len;
+                        const ws_copy_len = @min(recv_data.len, ws_space);
+                        @memcpy(st.read_buf[st.read_len..][0..ws_copy_len], recv_data[0..ws_copy_len]);
+                        st.read_len += ws_copy_len;
+
+                        // Return buffer to kernel
+                        buf_group.put_cqe(cqe) catch {};
+
+                        // Parse and echo WebSocket frames
+                        var ws_off: usize = 0;
+                        var ws_close = false;
+                        while (ws_off < st.read_len) {
+                            const ws_parse = websocket.parseFrame(st.read_buf[ws_off..st.read_len]) orelse break;
+                            const frame = ws_parse.frame;
+                            switch (frame.opcode) {
+                                .text, .binary => {
+                                    var ws_frame_buf: [65536 + 14]u8 = undefined;
+                                    if (websocket.buildFrame(&ws_frame_buf, frame.opcode, frame.payload, frame.fin)) |echo_frame| {
+                                        st.write_buf.appendSlice(echo_frame) catch {};
                                     }
-                                    st.revertToStatic();
-                                    st.read_len = if (rem <= 65536) rem else 0;
-                                } else {
-                                    const rem = st.read_len - off;
-                                    if (rem > 0) std.mem.copyForwards(u8, st.read_buf[0..rem], st.read_buf[off..st.read_len]);
-                                    st.read_len = rem;
-                                }
+                                },
+                                .ping => {
+                                    var pong_buf: [131]u8 = undefined;
+                                    if (websocket.buildFrame(&pong_buf, .pong, frame.payload, true)) |pong_frame| {
+                                        st.write_buf.appendSlice(pong_frame) catch {};
+                                    }
+                                },
+                                .close => {
+                                    var close_buf: [131]u8 = undefined;
+                                    if (websocket.buildCloseFrame(&close_buf, .normal, "")) |close_frame| {
+                                        st.write_buf.appendSlice(close_frame) catch {};
+                                    }
+                                    ws_close = true;
+                                },
+                                else => {},
                             }
+                            ws_off += ws_parse.consumed;
+                        }
 
-                            // Submit send if data ready
+                        // Compact read buffer
+                        if (ws_off > 0) {
+                            const ws_rem = st.read_len - ws_off;
+                            if (ws_rem > 0) {
+                                std.mem.copyForwards(u8, st.read_buf[0..ws_rem], st.read_buf[ws_off..st.read_len]);
+                            }
+                            st.read_len = ws_rem;
+                        }
+
+                        // Submit send if data ready
+                        if (st.write_buf.items.len > st.write_off and !st.send_inflight) {
+                            const send_data = st.write_buf.items[st.write_off..];
+                            if (send_zc_state != 2) {
+                                armSendZc(&ring, cqe_gen, fd, send_data) catch {
+                                    armSend(&ring, cqe_gen, fd, send_data) catch {};
+                                };
+                            } else {
+                                armSend(&ring, cqe_gen, fd, send_data) catch {};
+                            }
+                            st.send_inflight = true;
+                            needs_submit = true;
+                        }
+
+                        if (ws_close) {
+                            // Flush close frame then close connection
                             if (st.write_buf.items.len > st.write_off and !st.send_inflight) {
-                                const send_data = st.write_buf.items[st.write_off..];
-                                if (send_zc_state != 2) {
-                                    armSendZc(&ring, fd, send_data) catch {
-                                        armSend(&ring, fd, send_data) catch {};
-                                    };
-                                } else {
-                                    armSend(&ring, fd, send_data) catch {};
-                                }
+                                const send_data2 = st.write_buf.items[st.write_off..];
+                                armSend(&ring, cqe_gen, fd, send_data2) catch {};
                                 st.send_inflight = true;
                                 needs_submit = true;
                             }
-                        } else {
-                            buf_group.put_cqe(cqe) catch {};
+                            // Close after send completes (send handler will see ws_close flag)
+                            // For simplicity, close immediately — close frame already queued
+                            closeConn(&conns, &conn_gens, &pool_opt, &ring, fd, alloc, false);
+                            active_conns -|= 1;
+                        } else if (!has_more) {
+                            _ = buf_group.recv_multishot(packUserData(.recv, cqe_gen, fd), fd, 0) catch {};
+                            needs_submit = true;
                         }
+                        continue;
+                    }
+
+                    // Normal mode — copy recv data into connection buffer
+                    if (st.dyn_buf) |dbuf| {
+                        const space = dbuf.len - st.dyn_len;
+                        const copy_len = @min(recv_data.len, space);
+                        @memcpy(dbuf[st.dyn_len..][0..copy_len], recv_data[0..copy_len]);
+                        st.dyn_len += copy_len;
                     } else {
-                        buf_group.put_cqe(cqe) catch {};
+                        const space = st.read_buf.len - st.read_len;
+                        const copy_len = @min(recv_data.len, space);
+                        @memcpy(st.read_buf[st.read_len..][0..copy_len], recv_data[0..copy_len]);
+                        st.read_len += copy_len;
+                    }
+
+                    // Return buffer to kernel (zero-SQE)
+                    buf_group.put_cqe(cqe) catch {};
+
+                    // Parse and handle pipelined requests
+                    var off: usize = 0;
+                    const cur_len = st.activeReadLen();
+                    const cur_data = st.readSlice();
+                    while (off < cur_len) {
+                        const result = parser.parse(cur_data[off..cur_len]) orelse {
+                            const remaining = cur_data[off..cur_len];
+                            if (mem.indexOf(u8, remaining, "\r\n\r\n")) |hdr_end| {
+                                const hdr_data = remaining[0 .. hdr_end + 4];
+                                if (parser.parseHeaders(hdr_data)) |hdr_result| {
+                                    if (hdr_result.content_length != null and hdr_result.content_length.? > BODY_DISCARD_THRESHOLD) {
+                                        const body_bytes_in_buf = cur_len - off - (hdr_end + 4);
+                                        st.enterDiscardMode(hdr_result, body_bytes_in_buf);
+                                        off = cur_len;
+                                        break;
+                                    }
+                                }
+                                const bad_resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\nConnection: close\r\n\r\nBad Request";
+                                st.write_buf.appendSlice(bad_resp) catch {};
+                                off += hdr_end + 4;
+                                break;
+                            }
+                            break;
+                        };
+                        var req = result.request;
+                        var resp = Response{};
+                        if (shutdown_flag.load(.acquire)) resp.headers.set("Connection", "close");
+                        const req_start = if (logging) log_mod.now() else 0;
+                        router.handle(&req, &resp);
+
+                        // Check if handler upgraded to WebSocket
+                        if (resp.ws_upgraded) {
+                            if (req.headers.get("Sec-WebSocket-Key")) |ws_key| {
+                                var upgrade_buf: [256]u8 = undefined;
+                                if (websocket.buildUpgradeResponse(&upgrade_buf, ws_key, null)) |upgrade_resp| {
+                                    st.write_buf.appendSlice(upgrade_resp) catch {};
+                                }
+                            }
+                            st.ws_mode = true;
+                            off += result.total_len;
+                            break; // stop HTTP parsing — switch to WebSocket mode
+                        }
+
+                        if (compression_enabled) _ = compress_mod.compressResponse(&compress_buf, &req, &resp);
+                        if (logging) log_mod.logRequest(log_config, &req, &resp, req_start);
+                        resp.writeTo(&st.write_buf);
+                        off += result.total_len;
+                    }
+
+                    // Compact read buffer
+                    if (off > 0 and !st.isDiscarding()) {
+                        if (st.dyn_buf != null) {
+                            const rem = st.dyn_len - off;
+                            if (rem > 0 and rem <= 65536) {
+                                @memcpy(st.read_buf[0..rem], st.dyn_buf.?[off..st.dyn_len]);
+                            }
+                            st.revertToStatic();
+                            st.read_len = if (rem <= 65536) rem else 0;
+                        } else {
+                            const rem = st.read_len - off;
+                            if (rem > 0) std.mem.copyForwards(u8, st.read_buf[0..rem], st.read_buf[off..st.read_len]);
+                            st.read_len = rem;
+                        }
+                    }
+
+                    // Submit send if data ready
+                    if (st.write_buf.items.len > st.write_off and !st.send_inflight) {
+                        const send_data = st.write_buf.items[st.write_off..];
+                        if (send_zc_state != 2) {
+                            armSendZc(&ring, cqe_gen, fd, send_data) catch {
+                                armSend(&ring, cqe_gen, fd, send_data) catch {};
+                            };
+                        } else {
+                            armSend(&ring, cqe_gen, fd, send_data) catch {};
+                        }
+                        st.send_inflight = true;
+                        needs_submit = true;
                     }
 
                     // Re-arm recv if multishot dropped
                     if (!has_more) {
-                        if (uidx < MAX_CONNS and conns[uidx] != null) {
-                            _ = buf_group.recv_multishot(
-                                packUserData(.recv, fd),
-                                fd,
-                                0,
-                            ) catch continue;
-                            needs_submit = true;
-                        }
+                        _ = buf_group.recv_multishot(packUserData(.recv, cqe_gen, fd), fd, 0) catch {};
+                        needs_submit = true;
                     }
                 },
 
                 .send => {
+                    const cqe_gen = unpackGen(ud);
                     const uidx: usize = @intCast(@as(u32, @bitCast(fd)));
                     if (uidx >= MAX_CONNS) continue;
+                    // Stale send CQE — fd was closed+reused
+                    if (conn_gens[uidx] != cqe_gen) continue;
                     const st = conns[uidx] orelse continue;
 
                     // send_zc notification — buffer safe to reuse
@@ -761,7 +904,7 @@ fn reactorThread(
                             st.write_buf.clearRetainingCapacity();
                             st.write_off = 0;
                             if (shutdown_flag.load(.acquire)) {
-                                closeConn(&conns, &pool_opt, &ring, fd, alloc, false);
+                                closeConn(&conns, &conn_gens, &pool_opt, &ring, fd, alloc, false); active_conns -|= 1;
                             }
                         }
                         continue;
@@ -770,13 +913,13 @@ fn reactorThread(
                     if (res <= 0) {
                         if (send_zc_state == 0 and (res == -22 or res == -38)) {
                             send_zc_state = 2;
-                            armSend(&ring, fd, st.write_buf.items[st.write_off..]) catch {
+                            armSend(&ring, cqe_gen, fd, st.write_buf.items[st.write_off..]) catch {
                                 st.send_inflight = false;
                             };
                             needs_submit = true;
                             continue;
                         }
-                        closeConn(&conns, &pool_opt, &ring, fd, alloc, false);
+                        closeConn(&conns, &conn_gens, &pool_opt, &ring, fd, alloc, false); active_conns -|= 1;
                         continue;
                     }
 
@@ -793,7 +936,7 @@ fn reactorThread(
 
                     if (st.write_off < st.write_buf.items.len) {
                         // Partial send — use regular send for remainder
-                        armSend(&ring, fd, st.write_buf.items[st.write_off..]) catch {
+                        armSend(&ring, cqe_gen, fd, st.write_buf.items[st.write_off..]) catch {
                             st.send_inflight = false;
                         };
                         needs_submit = true;
@@ -803,7 +946,7 @@ fn reactorThread(
                             st.write_buf.clearRetainingCapacity();
                             st.write_off = 0;
                             if (shutdown_flag.load(.acquire)) {
-                                closeConn(&conns, &pool_opt, &ring, fd, alloc, false);
+                                closeConn(&conns, &conn_gens, &pool_opt, &ring, fd, alloc, false); active_conns -|= 1;
                             }
                         }
                     }
@@ -845,32 +988,36 @@ fn releaseConn(pool_opt: *?UringConnPool, st: *ConnState, alloc: std.mem.Allocat
 
 fn closeConn(
     conns: *[MAX_CONNS]?*ConnState,
+    conn_gens: *[MAX_CONNS]u24,
     pool_opt: *?UringConnPool,
     ring: *IoUring,
     fd: i32,
     alloc: std.mem.Allocator,
     use_direct_fds: bool,
 ) void {
+    _ = ring;
     const uidx: usize = @intCast(@as(u32, @bitCast(fd)));
     if (uidx < MAX_CONNS) {
         if (conns[uidx]) |st| {
             releaseConn(pool_opt, st, alloc);
             conns[uidx] = null;
         }
+        // Increment generation — any in-flight CQEs for this fd will now be stale
+        conn_gens[uidx] +%= 1;
     }
     if (use_direct_fds) {
-        _ = ring.close_direct(packUserData(.close, fd), @intCast(@as(u32, @bitCast(fd)))) catch {};
+        posix.close(@intCast(@as(u32, @bitCast(fd))));
     } else {
         posix.close(@intCast(@as(u32, @bitCast(fd))));
     }
 }
 
-fn armSend(ring: *IoUring, fd: i32, data: []const u8) !void {
-    _ = try ring.send(packUserData(.send, fd), fd, data, MSG_NOSIGNAL);
+fn armSend(ring: *IoUring, gen: u24, fd: i32, data: []const u8) !void {
+    _ = try ring.send(packUserData(.send, gen, fd), fd, data, MSG_NOSIGNAL);
 }
 
-fn armSendZc(ring: *IoUring, fd: i32, data: []const u8) !void {
-    _ = try ring.send_zc(packUserData(.send, fd), fd, data, MSG_NOSIGNAL, 0);
+fn armSendZc(ring: *IoUring, gen: u24, fd: i32, data: []const u8) !void {
+    _ = try ring.send_zc(packUserData(.send, gen, fd), fd, data, MSG_NOSIGNAL, 0);
 }
 
 fn setSockOptInt(fd: i32, level: i32, optname: u32, val: c_int) void {

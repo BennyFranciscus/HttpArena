@@ -4,6 +4,9 @@ const blitz = @import("blitz.zig");
 
 // ── Global pre-computed responses ───────────────────────────────────
 var dataset_json_resp: []const u8 = "";
+var dataset_gzip_resp: []const u8 = "";
+var compression_json_resp: []const u8 = "";
+var compression_gzip_resp: []const u8 = "";
 
 const StaticFile = struct {
     name: []const u8,
@@ -42,6 +45,18 @@ fn handleJson(_: *blitz.Request, res: *blitz.Response) void {
     _ = res.rawResponse(dataset_json_resp);
 }
 
+fn handleCompression(req: *blitz.Request, res: *blitz.Response) void {
+    // Check if client accepts gzip
+    if (req.headers.get("Accept-Encoding")) |ae| {
+        if (mem.indexOf(u8, ae, "gzip") != null) {
+            _ = res.rawResponse(compression_gzip_resp);
+            return;
+        }
+    }
+    // Fallback: uncompressed JSON
+    _ = res.rawResponse(compression_json_resp);
+}
+
 fn handleUpload(req: *blitz.Request, res: *blitz.Response) void {
     if (req.body) |body| {
         var nb: [32]u8 = undefined;
@@ -53,6 +68,17 @@ fn handleUpload(req: *blitz.Request, res: *blitz.Response) void {
     } else {
         _ = res.text("0");
     }
+}
+
+fn handleWsUpgrade(req: *blitz.Request, res: *blitz.Response) void {
+    if (!blitz.websocket.isUpgradeRequest(req)) {
+        // Non-WebSocket request (e.g. health check curl) — return 200
+        _ = res.text("WebSocket endpoint");
+        return;
+    }
+    // Signal the server to handle the WebSocket upgrade
+    // The server will build the 101 response using the request headers
+    res.ws_upgraded = true;
 }
 
 fn handleStatic(req: *blitz.Request, res: *blitz.Response) void {
@@ -143,6 +169,41 @@ fn loadDataset(path: []const u8) []const u8 {
     out.appendSlice(blitz.writeUsize(&cl_buf, json_buf.items.len)) catch return "";
     out.appendSlice("\r\n\r\n") catch return "";
     out.appendSlice(json_buf.items) catch return "";
+
+    // Build gzip pre-compressed response
+    const json_body = json_buf.items;
+    const gzip_buf = alloc.alloc(u8, json_body.len) catch {
+        json_buf.deinit();
+        return out.toOwnedSlice() catch "";
+    };
+    var fbs = std.io.fixedBufferStream(gzip_buf);
+    var compressor = std.compress.gzip.compressor(fbs.writer(), .{}) catch {
+        alloc.free(gzip_buf);
+        json_buf.deinit();
+        return out.toOwnedSlice() catch "";
+    };
+    _ = compressor.write(json_body) catch {
+        alloc.free(gzip_buf);
+        json_buf.deinit();
+        return out.toOwnedSlice() catch "";
+    };
+    compressor.finish() catch {
+        alloc.free(gzip_buf);
+        json_buf.deinit();
+        return out.toOwnedSlice() catch "";
+    };
+    const gzip_data = fbs.getWritten();
+
+    if (gzip_data.len > 0) {
+        var gzip_out = std.ArrayList(u8).init(alloc);
+        var gcl_buf: [32]u8 = undefined;
+        gzip_out.appendSlice("HTTP/1.1 200 OK\r\nServer: blitz\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nVary: Accept-Encoding\r\nContent-Length: ") catch {};
+        gzip_out.appendSlice(blitz.writeUsize(&gcl_buf, gzip_data.len)) catch {};
+        gzip_out.appendSlice("\r\n\r\n") catch {};
+        gzip_out.appendSlice(gzip_data) catch {};
+        dataset_gzip_resp = gzip_out.toOwnedSlice() catch "";
+    }
+    alloc.free(gzip_buf);
 
     json_buf.deinit();
     return out.toOwnedSlice() catch "";
@@ -263,8 +324,12 @@ fn getContentType(name: []const u8) []const u8 {
 // ── Main ────────────────────────────────────────────────────────────
 
 pub fn main() !void {
-    // Load data
+    // Load data — large dataset for /compression, small for /json
+    // loadDataset() sets dataset_gzip_resp as a side effect
+    compression_json_resp = loadDataset("/data/dataset-large.json");
+    compression_gzip_resp = dataset_gzip_resp;
     dataset_json_resp = loadDataset("/data/dataset.json");
+    // dataset_gzip_resp now has the small dataset gzip (used by /json if needed)
     loadStaticFiles();
 
     // Set up router
@@ -277,7 +342,9 @@ pub fn main() !void {
     router.post("/baseline11", handleBaseline);
     router.get("/baseline2", handleBaseline2);
     router.get("/json", handleJson);
+    router.get("/compression", handleCompression);
     router.post("/upload", handleUpload);
+    router.get("/ws", handleWsUpgrade);
     router.get("/static/*filepath", handleStatic);
 
     // Check if io_uring backend is requested
@@ -288,7 +355,17 @@ pub fn main() !void {
             .port = 8080,
             .compression = false,
         });
-        try uring_server.listen();
+        uring_server.listen() catch {
+            // io_uring init failed (seccomp/memlock/kernel) — fall back to epoll
+            _ = std.posix.write(2, "uring: init failed, falling back to epoll\n") catch {};
+            var server = blitz.Server.init(&router, .{
+                .port = 8080,
+                .keep_alive_timeout = 0,
+                .compression = false,
+            });
+            try server.listen();
+            return;
+        };
     } else {
         var server = blitz.Server.init(&router, .{
             .port = 8080,

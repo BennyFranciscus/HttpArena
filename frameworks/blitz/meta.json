@@ -12,6 +12,8 @@
     "noisy",
     "limited-conn",
     "json",
-    "upload"
+    "upload",
+    "compression",
+    "echo-ws"
   ]
 }
